@@ -21,7 +21,7 @@ notifications:
   pullrequests: github@arrow.apache.org
   jira_options: link label worklog
 github:
-  description: "Official Rust implementation of Apache Arrow"
+  description: "Experimental Rust implementation of Apache Arrow"
   homepage: https://arrow.apache.org/
   enabled_merge_buttons:
     squash: true
