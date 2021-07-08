@@ -1,0 +1,239 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use crate::{
+    array::{Array, ListArray, Offset},
+    bitmap::Bitmap,
+};
+
+use super::{
+    equal_range,
+    utils::{child_logical_null_buffer, count_validity},
+};
+
+fn lengths_equal<O: Offset>(lhs: &[O], rhs: &[O]) -> bool {
+    // invariant from `base_equal`
+    debug_assert_eq!(lhs.len(), rhs.len());
+
+    if lhs.is_empty() {
+        return true;
+    }
+
+    if lhs[0] == O::zero() && rhs[0] == O::zero() {
+        return lhs == rhs;
+    };
+
+    // The expensive case, e.g.
+    // [0, 2, 4, 6, 9] == [4, 6, 8, 10, 13]
+    lhs.windows(2)
+        .zip(rhs.windows(2))
+        .all(|(lhs_offsets, rhs_offsets)| {
+            // length of left == length of right
+            (lhs_offsets[1] - lhs_offsets[0]) == (rhs_offsets[1] - rhs_offsets[0])
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn offset_value_equal<O: Offset>(
+    lhs_values: &dyn Array,
+    rhs_values: &dyn Array,
+    lhs_validity: &Option<Bitmap>,
+    rhs_validity: &Option<Bitmap>,
+    lhs_offsets: &[O],
+    rhs_offsets: &[O],
+    lhs_pos: usize,
+    rhs_pos: usize,
+    len: usize,
+) -> bool {
+    let lhs_start = lhs_offsets[lhs_pos].to_usize().unwrap();
+    let rhs_start = rhs_offsets[rhs_pos].to_usize().unwrap();
+    let lhs_len = lhs_offsets[lhs_pos + len] - lhs_offsets[lhs_pos];
+    let rhs_len = rhs_offsets[rhs_pos + len] - rhs_offsets[rhs_pos];
+
+    lhs_len == rhs_len
+        && equal_range(
+            lhs_values,
+            rhs_values,
+            lhs_validity,
+            rhs_validity,
+            lhs_start,
+            rhs_start,
+            lhs_len.to_usize().unwrap(),
+        )
+}
+
+pub(super) fn equal<O: Offset>(
+    lhs: &ListArray<O>,
+    rhs: &ListArray<O>,
+    lhs_validity: &Option<Bitmap>,
+    rhs_validity: &Option<Bitmap>,
+    lhs_start: usize,
+    rhs_start: usize,
+    len: usize,
+) -> bool {
+    let lhs_offsets = lhs.offsets();
+    let rhs_offsets = rhs.offsets();
+
+    // There is an edge-case where a n-length list that has 0 children, results in panics.
+    // For example; an array with offsets [0, 0, 0, 0, 0] has 4 slots, but will have
+    // no valid children.
+    // Under logical equality, the child null bitmap will be an empty buffer, as there are
+    // no child values. This causes panics when trying to count set bits.
+    //
+    // We caught this by chance from an accidental test-case, but due to the nature of this
+    // crash only occuring on list equality checks, we are adding a check here, instead of
+    // on the buffer/bitmap utilities, as a length check would incur a penalty for almost all
+    // other use-cases.
+    //
+    // The solution is to check the number of child values from offsets, and return `true` if
+    // they = 0. Empty arrays are equal, so this is correct.
+    //
+    // It's unlikely that one would create a n-length list array with no values, where n > 0,
+    // however, one is more likely to slice into a list array and get a region that has 0
+    // child values.
+    // The test that triggered this behaviour had [4, 4] as a slice of 1 value slot.
+    let lhs_child_length = lhs_offsets.get(len).unwrap().to_usize().unwrap()
+        - lhs_offsets.first().unwrap().to_usize().unwrap();
+    let rhs_child_length = rhs_offsets.get(len).unwrap().to_usize().unwrap()
+        - rhs_offsets.first().unwrap().to_usize().unwrap();
+
+    if lhs_child_length == 0 && lhs_child_length == rhs_child_length {
+        return true;
+    }
+
+    let lhs_values = lhs.values().as_ref();
+    let rhs_values = rhs.values().as_ref();
+
+    let lhs_null_count = count_validity(lhs_validity, lhs_start, len);
+    let rhs_null_count = count_validity(rhs_validity, rhs_start, len);
+
+    // compute the child logical bitmap
+    let child_lhs_validity = child_logical_null_buffer(lhs, lhs_validity, lhs_values);
+    let child_rhs_validity = child_logical_null_buffer(rhs, rhs_validity, rhs_values);
+
+    if lhs_null_count == 0 && rhs_null_count == 0 {
+        lengths_equal(
+            &lhs_offsets[lhs_start..lhs_start + len],
+            &rhs_offsets[rhs_start..rhs_start + len],
+        ) && equal_range(
+            lhs_values,
+            rhs_values,
+            &child_lhs_validity,
+            &child_rhs_validity,
+            lhs_offsets[lhs_start].to_usize().unwrap(),
+            rhs_offsets[rhs_start].to_usize().unwrap(),
+            (lhs_offsets[len] - lhs_offsets[lhs_start])
+                .to_usize()
+                .unwrap(),
+        )
+    } else {
+        // get a ref of the parent null buffer bytes, to use in testing for nullness
+        let lhs_null_bytes = lhs_validity.as_ref().unwrap();
+        let rhs_null_bytes = rhs_validity.as_ref().unwrap();
+        // with nulls, we need to compare item by item whenever it is not null
+        (0..len).all(|i| {
+            let lhs_pos = lhs_start + i;
+            let rhs_pos = rhs_start + i;
+
+            let lhs_is_null = !lhs_null_bytes.get_bit(lhs_pos);
+            let rhs_is_null = !rhs_null_bytes.get_bit(rhs_pos);
+
+            lhs_is_null
+                || (lhs_is_null == rhs_is_null)
+                    && offset_value_equal::<O>(
+                        lhs_values,
+                        rhs_values,
+                        &child_lhs_validity,
+                        &child_rhs_validity,
+                        lhs_offsets,
+                        rhs_offsets,
+                        lhs_pos,
+                        rhs_pos,
+                        1,
+                    )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::array::equal::tests::test_equal;
+    use crate::array::{MutableListArray, MutablePrimitiveArray, TryExtend};
+
+    use super::*;
+
+    fn create_list_array<U: AsRef<[i32]>, T: AsRef<[Option<U>]>>(data: T) -> ListArray<i32> {
+        let iter = data.as_ref().iter().map(|x| {
+            x.as_ref()
+                .map(|x| x.as_ref().iter().map(|x| Some(*x)).collect::<Vec<_>>())
+        });
+        let mut array = MutableListArray::<i32, MutablePrimitiveArray<i32>>::new();
+        array.try_extend(iter).unwrap();
+        array.into()
+    }
+
+    #[test]
+    fn test_list_equal() {
+        let a = create_list_array(&[Some(&[1, 2, 3]), Some(&[4, 5, 6])]);
+        let b = create_list_array(&[Some(&[1, 2, 3]), Some(&[4, 5, 6])]);
+        test_equal(&a, &b, true);
+
+        let b = create_list_array(&[Some(&[1, 2, 3]), Some(&[4, 5, 7])]);
+        test_equal(&a, &b, false);
+    }
+
+    // Test the case where null_count > 0
+    #[test]
+    fn test_list_null() {
+        let a = create_list_array(&[Some(&[1, 2]), None, None, Some(&[3, 4]), None, None]);
+        let b = create_list_array(&[Some(&[1, 2]), None, None, Some(&[3, 4]), None, None]);
+        test_equal(&a, &b, true);
+
+        let b = create_list_array(&[
+            Some(&[1, 2]),
+            None,
+            Some(&[5, 6]),
+            Some(&[3, 4]),
+            None,
+            None,
+        ]);
+        test_equal(&a, &b, false);
+
+        let b = create_list_array(&[Some(&[1, 2]), None, None, Some(&[3, 5]), None, None]);
+        test_equal(&a, &b, false);
+    }
+
+    // Test the case where offset != 0
+    #[test]
+    fn test_list_offsets() {
+        let a = create_list_array(&[Some(&[1, 2]), None, None, Some(&[3, 4]), None, None]);
+        let b = create_list_array(&[Some(&[1, 2]), None, None, Some(&[3, 5]), None, None]);
+
+        let a_slice = a.slice(0, 3);
+        let b_slice = b.slice(0, 3);
+        test_equal(&a_slice, &b_slice, true);
+
+        let a_slice = a.slice(0, 5);
+        let b_slice = b.slice(0, 5);
+        test_equal(&a_slice, &b_slice, false);
+
+        let a_slice = a.slice(4, 1);
+        let b_slice = b.slice(4, 1);
+        test_equal(&a_slice, &b_slice, true);
+    }
+}

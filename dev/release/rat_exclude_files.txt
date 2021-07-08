@@ -1,0 +1,14 @@
+venv/*
+testing/*
+target/*
+dev/release/rat_exclude_files.txt
+arrow/test/data/*
+.gitattributes
+**.gitignore
+.gitmodules
+Cargo.lock
+filtered_rat.txt
+rat.txt
+# auto-generated
+arrow-flight/src/arrow.flight.protocol.rs
+test/*

@@ -1,0 +1,46 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+extern crate arrow2;
+
+use arrow2::{array::PrimitiveArray, bitmap::*, buffer::*};
+
+use criterion::{criterion_group, criterion_main, Criterion};
+
+fn add_benchmark(c: &mut Criterion) {
+    let values = 0..1026;
+
+    let values = values.collect::<Vec<_>>();
+    c.bench_function("buffer", |b| {
+        b.iter(|| MutableBuffer::from_trusted_len_iter(values.clone().into_iter()))
+    });
+
+    let bools = values.clone().into_iter().map(|x| x % 5 == 0);
+    c.bench_function("bitmap", |b| {
+        b.iter(|| MutableBitmap::from_trusted_len_iter(bools.clone()))
+    });
+
+    let maybe_values = values
+        .into_iter()
+        .map(|x| if x % 5 == 0 { Some(x) } else { None });
+    c.bench_function("primitive", |b| {
+        b.iter(|| PrimitiveArray::from_trusted_len_iter(maybe_values.clone()))
+    });
+}
+
+criterion_group!(benches, add_benchmark);
+criterion_main!(benches);

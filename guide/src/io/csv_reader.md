@@ -1,0 +1,58 @@
+<!---
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing,
+  software distributed under the License is distributed on an
+  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+  KIND, either express or implied.  See the License for the
+  specific language governing permissions and limitations
+  under the License.
+-->
+
+# CSV reader
+
+When compiled with feature `io_csv`, you can use this crate to read CSV files.
+This crate makes minimal assumptions on how you want to read a CSV, and offers a large degree of customization to it, along with a useful default.
+
+## Background
+
+There are two CPU-intensive tasks in reading a CSV file:
+* split the CSV file into rows, which includes parsing quotes and delimiters, and is necessary to `seek` to a given row.
+* parse a set of CSV rows (bytes) into a `RecordBatch`.
+
+Parsing bytes into values is more expensive than interpreting lines. As such, it is generally advantageous to have multiple readers of a single file that scan different parts of the file (within IO constraints).
+
+This crate relies on [the crate `csv`](https://crates.io/crates/csv) to scan and seek CSV files, and your code also needs such a dependency. With that said, `arrow2` makes no assumptions as to how to efficiently read the CSV: as a single reader per file or multiple readers.
+
+As an example, the following infers the schema and reads a CSV by re-using the same reader:
+
+```rust
+{{#include ../../../examples/csv_read.rs}}
+```
+
+## Orchestration and parallelization
+
+Because `csv`'s API is synchronous, the functions above represent the "minimal
+unit of synchronous work", IO and CPU. Note that `rows` above are `Send`,
+which implies that it is possible to run `parse` on a separate thread,
+thereby maximizing IO throughput. The example below shows how to do just that:
+
+```rust
+{{#include ../../../examples/csv_read_parallel.rs}}
+```
+
+## Customization
+
+In the code above, `parser` and `infer` allow for customization: they declare
+how rows of bytes should be inferred (into a logical type), and processed (into a value of said type).
+They offer good default options, but you can customize the inference and parsing to your own needs.
+You can also of course decide to parse everything into memory as `Utf8Array` and
+delay any data transformation.
